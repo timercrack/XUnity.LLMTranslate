@@ -10,6 +10,8 @@ import threading
 import time
 import concurrent.futures
 import socket
+import json
+import traceback
 from typing import Dict, Any, Callable, Optional, List
 
 from core.utils import convert_punctuation
@@ -18,10 +20,25 @@ class TranslationHandler(http.server.BaseHTTPRequestHandler):
     """翻译请求处理类"""
     
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+
+    @staticmethod
+    def _safe_excerpt(text: str, limit: int = 200) -> str:
+        if text is None:
+            return ""
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}...(truncated)"
+
+    @staticmethod
+    def _print_json(label: str, data: Any):
+        try:
+            serialized = json.dumps(data, ensure_ascii=False)
+        except Exception:
+            serialized = str(data)
+        print(f"[server] {label}: {serialized}")
     
-    def __init__(self, *args, config=None, log_callback=None, app=None, api_client=None, **kwargs):
+    def __init__(self, *args, config=None, app=None, api_client=None, **kwargs):
         self.config = config
-        self.log_callback = log_callback
         self.app = app
         self.api_client = api_client
         self.result_queue = queue.Queue()
@@ -34,13 +51,14 @@ class TranslationHandler(http.server.BaseHTTPRequestHandler):
             try:
                 print("开始关闭线程池资源...")
                 cls.executor.shutdown(wait=False)
-                
+
                 cls.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                
+
                 shutdown_success = False
                 try:
+                    executor_ref = cls.executor
                     shutdown_thread = threading.Thread(
-                        target=lambda: cls.executor.shutdown(wait=True),
+                        target=lambda: executor_ref.shutdown(wait=True) if executor_ref else None,
                         daemon=True
                     )
                     shutdown_thread.start()
@@ -60,113 +78,186 @@ class TranslationHandler(http.server.BaseHTTPRequestHandler):
                 print(f"关闭线程池时出错: {str(e)}")
                 cls.executor = None
     
+    def _log(self, message: str):
+        print(f"[server] {message}")
+
     def log_message(self, format, *args):
-        """日志记录"""
-        message = f"{self.address_string()} - {format % args}"
-        if self.log_callback:
-            self.log_callback(message)
+        """屏蔽默认的HTTP请求日志"""
+        pass
     
     def update_conversation_history(self, user_text, ai_response):
         """更新对话历史"""
         if self.app:
             self.app.update_conversation_history(user_text, ai_response)
     
-    def do_GET(self):
-        """处理GET请求"""
+    def do_POST(self):
+        """处理POST请求（批量翻译）"""
+        request_id = f"req-{int(time.time() * 1000)}-{threading.get_ident()}"
+        self.request_id = request_id
         try:
-            query_components = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            
-            if 'text' not in query_components:
-                self.send_response(400)
-                self.send_header('Content-type', 'text/plain; charset=utf-8')
-                self.end_headers()
-                self.wfile.write("缺少text参数".encode('utf-8'))
-                self.log_callback("错误: 缺少text参数")
+            content_length = int(self.headers.get('Content-Length', 0))
+            raw_body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else ''
+
+            # self._log(f"[{request_id}] 收到批量翻译POST请求，正文长度 {content_length} 字节")
+
+            if not raw_body:
+                self._write_plain_response(400, "请求体为空")
+                self._log(f"[{request_id}] 错误: 收到空的批量请求体")
                 return
-            
-            text_to_translate = query_components['text'][0]
-            self.log_callback(f"接收到翻译请求: {text_to_translate[:50]}...")
-            
-            TranslationHandler.executor.submit(self._process_translation_request, text_to_translate)
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            
-            translated_text = None
-            timeout = 180
-            start_time = time.time()
-            
-            while (translated_text is None and 
-                   time.time() - start_time < timeout and 
-                   not (self.app and getattr(self.app, 'is_shutting_down', False))):
-                try:
-                    translated_text = self.result_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-            
-            if self.app and getattr(self.app, 'is_shutting_down', False):
-                translated_text = "翻译失败: 应用程序正在关闭"
-                self.log_callback("应用程序正在关闭，中断等待翻译结果")
-            elif translated_text is None:
-                translated_text = "翻译失败: 处理超时"
-                self.log_callback("错误: 翻译处理超时")
-            
-            translated_text = convert_punctuation(translated_text)
-            
-            self.wfile.write(translated_text.encode('utf-8'))
-            self.log_callback(f"翻译完成: {translated_text[:50]}...")
-            
+
+            try:
+                payload = json.loads(raw_body)
+            except json.JSONDecodeError:
+                self._write_plain_response(400, "请求体不是有效的JSON")
+                excerpt = self._safe_excerpt(raw_body)
+                self._log(f"[{request_id}] 错误: 批量请求体不是有效的JSON，raw='{excerpt}'")
+                return
+
+            # self._print_json("收到请求", payload)
+
+            texts = payload.get("texts")
+            if not isinstance(texts, list) or len(texts) == 0:
+                self._write_plain_response(400, "缺少texts数组")
+                self._log(f"[{request_id}] 错误: 批量请求缺少texts数组")
+                self._print_json(f"[{request_id}] 无效payload", payload)
+                return
+
+            normalized_texts = [str(item) if item is not None else "" for item in texts]
+            print(f"[{request_id}] 接收到批量翻译请求，共 {len(normalized_texts)} 条")
+
+            self._submit_translation(normalized_texts)
+            result = self._wait_for_result()
+
+            if not result.get("success"):
+                error_message = result.get("error", "翻译失败")
+                self._log(f"[{request_id}] 批量翻译失败: {error_message}")
+                self._print_json(f"[{request_id}] 批量翻译失败详情", result)
+                self._write_plain_response(500, error_message)
+                return
+
+            translations = result.get("translations", [])
+            usage = result.get("usage")
+
+            response_payload: Dict[str, Any] = {
+                "translations": translations
+            }
+
+            if usage:
+                response_payload["usage"] = usage
+
+            self._write_json_response(200, response_payload)
+            # self._log(f"[{request_id}] 批量翻译完成，共 {len(translations)} 条")
+
         except Exception as e:
-            self.log_callback(f"处理请求时出错: {str(e)}")
-            self.send_response(500)
-            self.send_header('Content-type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(f"服务器错误: {str(e)}".encode('utf-8'))
+            self._log(f"[{request_id}] 处理批量请求时出错: {str(e)}")
+            self._log(traceback.format_exc())
+            self._write_plain_response(500, f"服务器错误: {str(e)}")
     
-    def _process_translation_request(self, text):
+    def _process_translation_request(self, payload):
         """处理翻译请求"""
         try:
+            request_id = getattr(self, "request_id", "req-unknown")
             if self.app and getattr(self.app, 'is_shutting_down', False):
-                self.log_callback("应用程序正在关闭，取消翻译请求")
-                self.result_queue.put("翻译失败: 应用程序正在关闭")
+                self._log(f"[{request_id}] 应用程序正在关闭，取消翻译请求")
+                self.result_queue.put({"success": False, "error": "翻译失败: 应用程序正在关闭"})
                 return
-            
-            # 使用API客户端翻译文本
-            if self.api_client:
-                conversation_history = self.app.conversation_history if self.app else None
-                result = self.api_client.translate_text(text, conversation_history)
-                
-                if result["success"]:
-                    translated_text = result["text"]
-                    
-                    # 更新token计数
-                    if "usage" in result and self.app:
-                        usage = result["usage"]
-                        prompt_tokens = usage.get("prompt_tokens", 0)
-                        completion_tokens = usage.get("completion_tokens", 0)
-                        total_tokens = usage.get("total_tokens", 0)
-                        
-                        self.app.update_token_count(prompt_tokens, completion_tokens, total_tokens)
-                    
-                    # 更新对话历史
-                    self.update_conversation_history(text, translated_text)
-                else:
-                    translated_text = result["text"]  # 这里是错误信息
-            else:
-                self.log_callback("错误: API客户端未初始化")
-                translated_text = "翻译失败: API客户端未初始化"
-                
+
+            if not self.api_client:
+                self._log(f"[{request_id}] 错误: API客户端未初始化")
+                self.result_queue.put({"success": False, "error": "翻译失败: API客户端未初始化"})
+                return
+
+            texts_to_translate = payload if isinstance(payload, list) else [payload]
+            texts_to_translate = [str(item) if item is not None else "" for item in texts_to_translate]
+
+            result = self.api_client.translate_batch(texts_to_translate, None)
+            # self._print_json(f"[{request_id}] 翻译响应", result)
+
+            if not result.get("success"):
+                error_message = result.get("text") or result.get("error") or "翻译失败"
+                self._log(f"[{request_id}] 翻译接口返回失败: {error_message}")
+                self._print_json(f"[{request_id}] 失败响应详情", result)
+                self.result_queue.put({"success": False, "error": error_message})
+                return
+
+            translations = result.get("translations", [])
+            if len(translations) != len(texts_to_translate):
+                self._log(
+                    f"[{request_id}] 翻译失败: 返回数量 {len(translations)} 与请求数量 {len(texts_to_translate)} 不匹配"
+                )
+                self.result_queue.put({"success": False, "error": "翻译失败: 返回数量与请求数量不匹配"})
+                return
+
+            translations = [convert_punctuation(item) for item in translations]
+
+            usage = result.get("usage")
+            if usage and self.app:
+                prompt_tokens = usage.get('prompt_tokens', 0)
+                completion_tokens = usage.get('completion_tokens', 0)
+                total_tokens = usage.get('total_tokens', 0)
+                self.app.update_token_count(prompt_tokens, completion_tokens, total_tokens)
+
+            if self.app:
+                for original, translated in zip(texts_to_translate, translations):
+                    self.update_conversation_history(original, translated)
+
             if self.app and getattr(self.app, 'is_shutting_down', False):
-                self.log_callback("应用程序正在关闭，放弃返回翻译结果")
+                self._log(f"[{request_id}] 应用程序正在关闭，放弃返回翻译结果")
                 return
-            
-            self.result_queue.put(translated_text)
+
+            # self._log(f"[{request_id}] 批量翻译完成: {len(translations)} 条")
+
+            self.result_queue.put({
+                "success": True,
+                "translations": translations,
+                "usage": usage
+            })
         except Exception as e:
             error_message = f"翻译失败: {str(e)}"
-            self.log_callback(f"翻译处理异常: {str(e)}")
+            request_id = getattr(self, "request_id", "req-unknown")
+            self._log(f"[{request_id}] 翻译处理异常: {str(e)}")
+            self._log(traceback.format_exc())
             if not (self.app and getattr(self.app, 'is_shutting_down', False)):
-                self.result_queue.put(error_message)
+                self.result_queue.put({"success": False, "error": error_message})
+
+    def _submit_translation(self, payload):
+        if TranslationHandler.executor is None:
+            TranslationHandler.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+
+        TranslationHandler.executor.submit(self._process_translation_request, payload)
+
+    def _wait_for_result(self, timeout: float = 180.0) -> Dict[str, Any]:
+        start_time = time.time()
+        request_id = getattr(self, "request_id", "req-unknown")
+
+        while time.time() - start_time < timeout:
+            if self.app and getattr(self.app, 'is_shutting_down', False):
+                self._log(f"[{request_id}] 应用程序正在关闭，中断等待翻译结果")
+                return {"success": False, "error": "翻译失败: 应用程序正在关闭"}
+
+            try:
+                return self.result_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+        self._log(f"[{request_id}] 错误: 翻译处理超时")
+        return {"success": False, "error": "翻译失败: 处理超时"}
+
+    def _write_plain_response(self, status_code: int, message: str):
+        payload = (message or "").encode('utf-8')
+        self.send_response(status_code)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _write_json_response(self, status_code: int, payload: Dict[str, Any]):
+        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -186,40 +277,42 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class ServerManager:
     """服务器管理类"""
     
-    def __init__(self, config, log_callback=None, app=None, api_client=None):
+    def __init__(self, config, app=None, api_client=None):
         """
         初始化服务器管理类
         
         Args:
             config: 配置信息
-            log_callback: 日志回调函数
             app: 应用程序实例
             api_client: API客户端实例
         """
         self.config = config
-        self.log_callback = log_callback
         self.app = app
         self.api_client = api_client
         self.server = None
         self.server_thread = None
         self.is_running = False
+
+    def _log(self, message: str):
+        print(f"[server] {message}")
     
     def is_port_available(self, port: int) -> bool:
         """检查端口是否可用"""
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             test_socket.settimeout(1)
             test_socket.bind(('', port))
-            test_socket.close()
             return True
         except socket.error:
             return False
+        finally:
+            test_socket.close()
     
     def start(self) -> bool:
         """启动服务器"""
         if self.is_running:
-            if self.log_callback:
-                self.log_callback("服务已经在运行中")
+            self._log("服务已经在运行中")
             return False
         
         try:
@@ -228,20 +321,17 @@ class ServerManager:
                 if port < 1 or port > 65535:
                     raise ValueError("端口号必须在1-65535之间")
             except ValueError as e:
-                if self.log_callback:
-                    self.log_callback(f"端口号无效: {str(e)}")
+                self._log(f"端口号无效: {str(e)}")
                 return False
             
             if not self.is_port_available(port):
-                if self.log_callback:
-                    self.log_callback(f"端口 {port} 已被占用，请尝试其他端口")
+                self._log(f"端口 {port} 已被占用，请尝试其他端口")
                 return False
             
             def handler_factory(*args, **kwargs):
                 return TranslationHandler(
                     *args, 
                     config=self.config, 
-                    log_callback=self.log_callback, 
                     app=self.app,
                     api_client=self.api_client,
                     **kwargs
@@ -254,71 +344,54 @@ class ServerManager:
             
             self.is_running = True
             
-            if self.log_callback:
-                self.log_callback(f"服务已启动，监听端口 {port}")
+            self._log(f"服务已启动，监听端口 {port}")
             
             return True
         except Exception as e:
-            if self.log_callback:
-                self.log_callback(f"启动服务失败: {str(e)}")
+            self._log(f"启动服务失败: {str(e)}")
             return False
     
     def stop(self) -> bool:
         """停止服务器"""
         if not self.is_running or not self.server:
-            if self.log_callback:
-                self.log_callback("服务未在运行")
+            self._log("服务未在运行")
             return False
         
         try:
-            if self.log_callback:
-                self.log_callback("正在取消所有待处理的请求...")
+            self._log("正在取消所有待处理的请求...")
             
-            shutdown_thread = threading.Thread(
-                target=self._shutdown_server_thread,
-                daemon=True
-            )
-            shutdown_thread.start()
-            
-            shutdown_thread.join(3.0)
-            
-            if shutdown_thread.is_alive():
-                if self.log_callback:
-                    self.log_callback("服务器关闭操作超时，将强制关闭...")
-                self.server = None
-                self.server_thread = None
-            
+            TranslationHandler.close_resources()
+
+            self._log("正在关闭服务器...")
+
+            if self.server:
+                self.server.shutdown()
+                self.server.server_close()
+
+            if self.server_thread:
+                self.server_thread.join(timeout=5.0)
+
+            if self.server_thread and self.server_thread.is_alive():
+                self._log("服务器线程关闭超时，将强制关闭...")
+            else:
+                self._log("服务器已正常关闭")
+
+            self.server = None
+            self.server_thread = None
             self.is_running = False
-            
-            if self.log_callback:
-                self.log_callback("服务已停止")
-            
+
+            self._log("服务已停止")
+
             return True
         except Exception as e:
-            if self.log_callback:
-                self.log_callback(f"停止服务器时出错: {str(e)}")
+            self._log(f"停止服务器时出错: {str(e)}")
             self.server = None
             self.server_thread = None
             self.is_running = False
             
-            if self.log_callback:
-                self.log_callback("服务已强制停止")
+            self._log("服务已强制停止")
             
             return True
-    
-    def _shutdown_server_thread(self):
-        """关闭服务器的线程方法"""
-        try:
-            if self.log_callback:
-                self.log_callback("正在关闭服务器...")
-            if self.server:
-                self.server.shutdown()
-                self.server.server_close()
-            if self.log_callback:
-                self.log_callback("服务器已正常关闭")
-        except Exception as e:
-            if self.log_callback:
-                self.log_callback(f"在线程中关闭服务器时出错: {str(e)}")
     
     def get_status(self) -> Dict[str, Any]:
         """获取服务器状态"""

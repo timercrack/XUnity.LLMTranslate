@@ -7,13 +7,11 @@ import time
 import threading
 import tkinter as tk
 import ttkbootstrap as ttk
-from typing import Dict, Any, List, Optional
-
 from core.config_manager import ConfigManager
 from core.api_client import APIClient
 from core.server import ServerManager, TranslationHandler
 from ui.theme_manager import ThemeManager
-from ui.components import ConfigPanel, HistoryPanel, TokenPanel, ControlPanel, LogPanel
+from ui.components import ConfigPanel, TokenPanel, ControlPanel
 
 class TranslationServiceApp:
     """翻译服务应用程序类"""
@@ -21,11 +19,11 @@ class TranslationServiceApp:
     def __init__(self):
         """初始化应用程序"""
         # 初始化主题管理器
-        self.theme_manager = ThemeManager(log_callback=self._log)
+        self.theme_manager = ThemeManager()
         
         # 创建主窗口
-        self.root = ttk.Window(title="XUnity大模型翻译 ver3.1", themename=self.theme_manager.get_current_theme())
-        self.root.geometry("800x900")
+        self.root = ttk.Window(title="XUnity大模型翻译批量处理版", themename=self.theme_manager.get_current_theme())
+        self._center_window(1024, 768)
         
         # 设置主题管理器的根窗口
         self.theme_manager.set_root(self.root)
@@ -43,21 +41,17 @@ class TranslationServiceApp:
         
         # 创建配置管理器
         self.config_manager = ConfigManager()
-        self.config = self.config_manager.load_config(log_callback=self._log)
+        self.config = self.config_manager.load_config()
         
         # 创建API客户端
-        self.api_client = APIClient(self.config, log_callback=self._log)
+        self.api_client = APIClient(self.config)
         
         # 创建服务器管理器
         self.server_manager = ServerManager(
-            self.config, 
-            log_callback=self._log, 
-            app=self, 
+            self.config,
+            app=self,
             api_client=self.api_client
         )
-        
-        # 初始化对话历史
-        self.conversation_history = []
         
         # 创建UI组件
         self._init_ui_components()
@@ -76,10 +70,6 @@ class TranslationServiceApp:
         # 确保默认配置被加载到界面上
         self.config_panel.load_config(self.config)
         
-        # 历史记录面板
-        self.history_panel = HistoryPanel(self.main_frame, self.default_font, self.bold_font)
-        self.history_panel.set_clear_callback(self.clear_conversation_history)
-        
         # Token统计面板
         self.token_panel = TokenPanel(self.main_frame, self.default_font, self.bold_font)
         self.token_panel.set_reset_callback(self.reset_token_count)
@@ -90,14 +80,17 @@ class TranslationServiceApp:
         self.control_panel.set_test_config_callback(self.test_config)
         self.control_panel.set_save_config_callback(self.save_config)
         
-        # 日志面板
-        self.log_panel = LogPanel(self.main_frame, self.default_font)
-    
     def _log(self, message: str):
         """记录日志"""
         print(message)
-        if hasattr(self, 'root') and self.root and not self.is_shutting_down:
-            self.root.after(0, lambda: self.log_panel.add_log(message) if hasattr(self, 'log_panel') else None)
+
+    def _center_window(self, width: int, height: int):
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = max((screen_width - width) // 2, 0)
+        y = max((screen_height - height) // 2, 0)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
     
     def _start_timers(self):
         """启动定时器"""
@@ -195,7 +188,9 @@ class TranslationServiceApp:
             self.api_client.config = self.config
             
             # 禁用按钮
-            self.config_panel.get_models_button.config(state=tk.DISABLED)
+            button = getattr(self.config_panel, "get_models_button", None)
+            if button:
+                button.config(state=tk.DISABLED)
             
             threading.Thread(
                 target=self._get_model_list_thread,
@@ -203,7 +198,9 @@ class TranslationServiceApp:
             ).start()
         except Exception as e:
             self._log(f"获取模型列表时发生错误: {str(e)}")
-            self.config_panel.get_models_button.config(state=tk.NORMAL)
+            button = getattr(self.config_panel, "get_models_button", None)
+            if button:
+                button.config(state=tk.NORMAL)
     
     def _get_model_list_thread(self):
         """获取模型列表的线程方法"""
@@ -224,7 +221,11 @@ class TranslationServiceApp:
         except Exception as e:
             self._log(f"获取模型列表过程中发生错误: {str(e)}")
         finally:
-            self.root.after(0, lambda: self.config_panel.get_models_button.config(state=tk.NORMAL))
+            def enable_button():
+                button = getattr(self.config_panel, "get_models_button", None)
+                if button:
+                    button.config(state=tk.NORMAL)
+            self.root.after(0, enable_button)
     
     def save_config(self):
         """保存配置"""
@@ -233,7 +234,7 @@ class TranslationServiceApp:
             self.config = self.config_panel.get_config()
             
             # 保存配置
-            if self.config_manager.save_config(self.config, log_callback=self._log):
+            if self.config_manager.save_config(self.config):
                 pass
             else:
                 self._log("保存配置失败")
@@ -249,40 +250,9 @@ class TranslationServiceApp:
         self.token_panel.reset_count()
         self._log("Token计数已重置")
     
-    def clear_conversation_history(self):
-        """清除对话历史"""
-        self.conversation_history = []
-        self.history_panel.update_history_status(0)
-        self._log("翻译上下文已清除")
-    
     def update_conversation_history(self, user_text, ai_response):
-        """更新对话历史"""
-        self.root.after(0, lambda: self._update_history_ui(user_text, ai_response))
-    
-    def _update_history_ui(self, user_text, ai_response):
-        """更新对话历史的UI方法"""
-        if self.is_shutting_down:
-            return
-            
-        self.conversation_history.append({
-            "role": "user",
-            "content": user_text
-        })
-        self.conversation_history.append({
-            "role": "assistant",
-            "content": ai_response
-        })
-        
-        # 限制历史记录长度
-        max_turns = int(self.config.get("context_turns", 5))
-        
-        if len(self.conversation_history) > max_turns * 2:
-            self.conversation_history = self.conversation_history[-max_turns * 2:]
-            
-        history_length = len(self.conversation_history) // 2
-        self._log(f"当前翻译上下文记录：{history_length}组")
-        
-        self.history_panel.update_history_status(history_length)
+        """历史记录功能已移除，保留方法保持兼容"""
+        return
     
     def on_close(self):
         """窗口关闭事件处理"""

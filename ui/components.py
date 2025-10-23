@@ -10,7 +10,7 @@ from typing import Callable, Optional, Dict, Any, List
 class ConfigPanel:
     """配置面板组件"""
     
-    def __init__(self, parent, default_font, bold_font, config: Dict[str, Any] = None):
+    def __init__(self, parent, default_font, bold_font, config: Optional[Dict[str, Any]] = None):
         """
         初始化配置面板
         
@@ -36,9 +36,7 @@ class ConfigPanel:
         self.temperature_entry = None
         self.max_tokens_var = None
         self.max_tokens_entry = None
-        self.context_turns_var = None
-        self.context_turns_entry = None
-        self.system_prompt_text = None
+        self.batch_prompt_text = None
         
         self._create_widgets()
     
@@ -110,7 +108,7 @@ class ConfigPanel:
         params_frame = ttk.Frame(self.config_frame)
         params_frame.grid(row=4, column=0, columnspan=2, sticky=tk.N, padx=5, pady=5)
         
-        for i in range(8):  # 增加列数以适应监听端口
+        for i in range(6):
             params_frame.columnconfigure(i, weight=1)
 
         # 所有设置居中对齐
@@ -129,17 +127,12 @@ class ConfigPanel:
         self.max_tokens_entry = ttk.Entry(params_frame, width=8, font=self.default_font, textvariable=self.max_tokens_var)
         self.max_tokens_entry.grid(row=0, column=5, sticky=tk.W, padx=5)
 
-        ttk.Label(params_frame, text="翻译上下文数量:", font=self.default_font).grid(row=0, column=6, sticky=tk.E, padx=5, pady=5)
-        self.context_turns_var = tk.StringVar()
-        self.context_turns_entry = ttk.Entry(params_frame, width=8, font=self.default_font, textvariable=self.context_turns_var)
-        self.context_turns_entry.grid(row=0, column=7, sticky=tk.W, padx=5)
-        
-        # 系统提示
-        prompt_frame = ttk.LabelFrame(self.parent, text="系统提示", padding=10)
+        # 批量提示
+        prompt_frame = ttk.LabelFrame(self.parent, text="批量翻译提示", padding=10)
         prompt_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.system_prompt_text = scrolledtext.ScrolledText(prompt_frame, wrap=tk.WORD, height=6, font=self.default_font)
-        self.system_prompt_text.pack(fill=tk.X, expand=True, padx=5, pady=5)
+        self.batch_prompt_text = scrolledtext.ScrolledText(prompt_frame, wrap=tk.WORD, height=6, font=self.default_font)
+        self.batch_prompt_text.pack(fill=tk.X, expand=True, padx=5, pady=5)
         
         self.config_frame.columnconfigure(1, weight=1)
     
@@ -169,28 +162,28 @@ class ConfigPanel:
             max_tokens = 4096
             self.max_tokens_var.set(str(max_tokens))
             
-        try:
-            context_turns = int(self.context_turns_var.get().strip())
-            context_turns = max(1, context_turns)
-        except (ValueError, TypeError):
-            context_turns = 5
-            self.context_turns_var.set(str(context_turns))
-            
-        return {
+        config_copy = dict(self.config) if self.config else {}
+        system_prompt_text = self.batch_prompt_text.get("1.0", tk.END).strip() if self.batch_prompt_text else ""
+
+        config_copy.update({
             "api_url": api_url,
             "api_key": self.api_key_entry.get().strip(),
             "model_name": self.model_name_var.get().strip(),
-            "system_prompt": self.system_prompt_text.get("1.0", tk.END).strip(),
             "port": self.port_var.get().strip(),
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "context_turns": context_turns
-        }
+            "system_prompt": system_prompt_text
+        })
+
+        self.config = config_copy
+        return config_copy
     
     def load_config(self, config: Dict[str, Any]):
         """加载配置"""
         if not config:
             return
+
+        self.config = config
             
         api_url_display = config.get("api_url", "")
         if api_url_display.endswith("/chat/completions"):
@@ -204,13 +197,13 @@ class ConfigPanel:
         
         self.model_name_var.set(config.get("model_name", ""))
         
-        self.system_prompt_text.delete("1.0", tk.END)
-        self.system_prompt_text.insert("1.0", config.get("system_prompt", ""))
+        if self.batch_prompt_text:
+            self.batch_prompt_text.delete("1.0", tk.END)
+            self.batch_prompt_text.insert("1.0", config.get("system_prompt", ""))
         
         self.port_var.set(config.get("port", ""))
         self.temperature_var.set(str(config.get("temperature", 1.0)))
         self.max_tokens_var.set(str(config.get("max_tokens", 4096)))
-        self.context_turns_var.set(str(config.get("context_turns", 5)))
     
     def update_model_list(self, models_list: List[str]):
         """更新模型列表"""
@@ -225,58 +218,6 @@ class ConfigPanel:
             self.model_name_var.set(models_list[0])
         else:
             self.model_name_var.set(current_value)
-
-
-class HistoryPanel:
-    """历史记录面板组件"""
-    
-    def __init__(self, parent, default_font, bold_font):
-        """初始化历史记录面板"""
-        self.parent = parent
-        self.default_font = default_font
-        self.bold_font = bold_font
-        
-        self.history_status_label = None
-        self.clear_history_button = None
-        
-        self._create_widgets()
-    
-    def _create_widgets(self):
-        """创建控件"""
-        history_frame = ttk.LabelFrame(self.parent, text="翻译上下文控制", padding=10)
-        history_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.history_status_label = ttk.Label(
-            history_frame,
-            text="翻译上下文: 0组",
-            font=self.bold_font
-        )
-        self.history_status_label.pack(side=tk.LEFT, padx=5)
-        
-        try:
-            self.clear_history_button = ttk.Button(
-                history_frame,
-                text="清除翻译上下文",
-                bootstyle="danger-outline",
-                width=15,
-                cursor="hand2"
-            )
-        except Exception:
-            self.clear_history_button = ttk.Button(
-                history_frame,
-                text="清除翻译上下文",
-                width=15,
-                cursor="hand2"
-            )
-        self.clear_history_button.pack(side=tk.RIGHT, padx=5)
-    
-    def set_clear_callback(self, callback: Callable):
-        """设置清除历史记录的回调函数"""
-        self.clear_history_button.config(command=callback)
-    
-    def update_history_status(self, count: int):
-        """更新历史记录状态"""
-        self.history_status_label.config(text=f"翻译上下文: {count}组")
 
 
 class TokenPanel:

@@ -3,27 +3,22 @@
 """
 
 import winreg
-from typing import Callable, Optional
-
 class ThemeManager:
     """主题管理类"""
     
-    def __init__(self, root=None, log_callback: Optional[Callable] = None):
+    def __init__(self, root=None):
         """
         初始化主题管理器
         
         Args:
             root: Tk/Tkinter窗口根对象
-            log_callback: 日志回调函数
         """
         self.root = root
-        self.log_callback = log_callback
         self.current_theme = self.detect_windows_theme()
     
     def log(self, message: str):
         """记录日志"""
-        if self.log_callback:
-            self.log_callback(message)
+        print(f"[theme] {message}")
     
     def detect_windows_theme(self) -> str:
         """
